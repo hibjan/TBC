@@ -5,9 +5,9 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 contract VotingToken is ERC20 {
 
-    address public owner; //QuadraticVoting
+    address public immutable owner; //QuadraticVoting
 
-    uint public maxSupply;
+    uint public immutable maxSupply;
 
     modifier onlyOwner() {
         require(msg.sender == owner, "VotingToken: solo el owner");

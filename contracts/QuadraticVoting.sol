@@ -31,11 +31,11 @@ contract QuadraticVoting {
     //                          ESTADO
     // =========================================================================
 
-    address public owner;
+    address public immutable owner;
 
-    VotingToken public votingToken;
+    VotingToken public immutable votingToken;
 
-    uint public tokenPrice;
+    uint public immutable tokenPrice;
 
     bool public votingOpen;
 
@@ -113,7 +113,9 @@ contract QuadraticVoting {
         require(msg.value > 0, "Debe aportar presupuesto inicial");
 
         votingOpen = true;
-        currentVotingRound++;
+        // unchecked: currentVotingRound es un contador que incrementa en uno por cada votación abierta
+        // El overflow (llegar a 2^256 - 1) es prácticamente imposible
+        unchecked { currentVotingRound++; }
         totalBudget = msg.value;
     }
 
@@ -146,7 +148,9 @@ contract QuadraticVoting {
         require(!participants[msg.sender], "Ya es participante");
 
         participants[msg.sender] = true;
-        participantCount++;
+        // unchecked: participantCount es un uint256 que solo se incrementa aquí.
+        // El overflow (llegar a 2^256 - 1) requiere que una cantidad prácticamente imposible se inscriba
+        unchecked { participantCount++; }
 
         _buyTokens(msg.sender, msg.value);
     }
@@ -156,7 +160,8 @@ contract QuadraticVoting {
     // Sus tokens y votos depositados se conservan (puede reclamarlos vía claimRefund tras el cierre).
     function removeParticipant() external onlyParticipant {
         participants[msg.sender] = false;
-        participantCount--;
+        // unchecked: el modificador onlyParticipant garantiza que participantCount >= 1
+        unchecked { participantCount--; }
     }
 
     // =========================================================================
@@ -201,7 +206,10 @@ contract QuadraticVoting {
         require(_proposalAddr != address(0), "Direccion de propuesta invalida");
         require(IERC165(_proposalAddr).supportsInterface(type(IExecutableProposal).interfaceId), "No implementa IExecutableProposal");
 
-        uint proposalId = proposalCount++;
+        // unchecked: proposalID es un contador que incrementa en uno por cada propuesta creada.
+        // El overflow (llegar a 2^256 - 1) es prácticamente imposible
+        uint proposalId;
+        unchecked { proposalId = proposalCount++; }
 
         Proposal storage p = proposals[proposalId];
         p.title = _title;
@@ -214,14 +222,10 @@ contract QuadraticVoting {
 
         if (_budget == 0) {
             // Propuesta de signaling
-            uint[] storage arr = signalingProposalIds[currentVotingRound];
-            p.arrayIndex = arr.length;
-            arr.push(proposalId);
+            p.arrayIndex = _appendToArray(signalingProposalIds[currentVotingRound], proposalId);
         } else {
             // Propuesta de financiación
-            uint[] storage arr = pendingFinancingIds[currentVotingRound];
-            p.arrayIndex = arr.length;
-            arr.push(proposalId);
+            p.arrayIndex = _appendToArray(pendingFinancingIds[currentVotingRound], proposalId);
         }
 
         return proposalId;
@@ -418,9 +422,7 @@ contract QuadraticVoting {
 
         // Mover de pendientes a aprobadas (swap-and-pop, O(1))
         _removeFromArray(pendingFinancingIds[currentVotingRound], p.arrayIndex);
-        uint[] storage approved = approvedProposalIds[currentVotingRound];
-        p.arrayIndex = approved.length;
-        approved.push(proposalId);
+        p.arrayIndex = _appendToArray(approvedProposalIds[currentVotingRound], proposalId);
 
         // Quemar los tokens consumidos por la aprobación
         votingToken.burn(address(this), p.totalTokensStaked);
@@ -436,10 +438,22 @@ contract QuadraticVoting {
         }(proposalId, executionVotes, executionTokens);
     }
 
+    // Añade un ID al final del array y devuelve el índice donde quedó.
+    // Centraliza el patrón "asignar arrayIndex y push" usado al crear propuestas
+    // y al promover de pendientes a aprobadas. Coste O(1).
+    function _appendToArray(uint[] storage arr, uint proposalId) internal returns (uint newIndex) {
+        newIndex = arr.length;
+        arr.push(proposalId);
+    }
+
     // Elimina un elemento de un array de IDs usando swap-and-pop.
     // Actualiza el arrayIndex de la propuesta movida. Coste O(1).
     function _removeFromArray(uint[] storage arr, uint index) internal {
-        uint lastIndex = arr.length - 1;
+        // unchecked: el caller solo invoca esta función con un index válido
+        // proveniente de p.arrayIndex de una propuesta que está en arr.
+        // Por tanto arr.length >= 1 y la resta no puede generar underflow.
+        uint lastIndex;
+        unchecked { lastIndex = arr.length - 1; }
 
         if (index != lastIndex) {
             uint lastId = arr[lastIndex];
