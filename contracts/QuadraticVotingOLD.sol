@@ -5,7 +5,7 @@ import "./IExecutableProposal.sol";
 import "./VotingToken.sol";
 import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 
-contract QuadraticVoting {
+contract QuadraticVotingOLD {
     // =========================================================================
     //                              TIPOS
     // =========================================================================
@@ -20,22 +20,23 @@ contract QuadraticVoting {
         address creator; // Participante que creó la propuesta
         ProposalStatus status;
         uint totalVotes; // Suma de votos recibidos
-        uint totalTokensStaked; // Suma de tokens bloqueados (coste cuadrático)
-        uint arrayIndex; // Índice en su array de la ronda (swap-and-pop)
+        uint totalTokensStaked; // Suma de tokens bloqueados (coste cuadrático acumulado)
+        uint arrayIndex; // Índice en su array correspondiente (swap-and-pop)
         uint votingRound; // Ronda en la que se creó la propuesta
-        bool signalingExecuted; // Solo signaling: evita doble ejecución (pull)
-        mapping(address => uint) voterVotes; // Votos depositados por votante
+        address[] voters; // Lista de votantes (para iterar en devoluciones)
+        mapping(address => uint) voterVotes; // Votos depositados por cada votante
+        mapping(address => bool) hasVoted; // Controla duplicados en voters[]
     }
 
     // =========================================================================
     //                          ESTADO
     // =========================================================================
 
-    address public immutable owner;
+    address public owner;
 
-    VotingToken public immutable votingToken;
+    VotingToken public votingToken;
 
-    uint public immutable tokenPrice;
+    uint public tokenPrice;
 
     bool public votingOpen;
 
@@ -58,13 +59,14 @@ contract QuadraticVoting {
     // Almacén de propuestas por ID
     mapping(uint => Proposal) internal proposals;
 
-    // Arrays de propuestas por ronda
-    mapping(uint => uint[]) internal pendingFinancingIds;
-    mapping(uint => uint[]) internal approvedProposalIds; 
-    mapping(uint => uint[]) internal signalingProposalIds; 
+    // IDs de propuestas de financiación pendientes de aprobar
+    uint[] internal pendingFinancingIds;
 
-    // Indica si el periodo de votación de una ronda ya fue cerrado
-    mapping(uint => bool) public roundClosed;
+    // IDs de propuestas de financiación aprobadas
+    uint[] internal approvedProposalIds;
+
+    // IDs de propuestas de signaling (presupuesto = 0)
+    uint[] internal signalingProposalIds;
 
     // =========================================================================
     //                           MODIFICADORES
@@ -113,24 +115,51 @@ contract QuadraticVoting {
         require(msg.value > 0, "Debe aportar presupuesto inicial");
 
         votingOpen = true;
-        // unchecked: currentVotingRound es un contador que incrementa en uno por cada votación abierta
-        // El overflow (llegar a 2^256 - 1) es prácticamente imposible
-        unchecked { currentVotingRound++; }
+        currentVotingRound++;
         totalBudget = msg.value;
+
+        // Limpiar arrays de la ronda anterior
+        delete pendingFinancingIds;
+        delete approvedProposalIds;
+        delete signalingProposalIds;
     }
 
-    // Cierre del periodo de votación. Pull-over-push: O(1).
-    // No itera sobre propuestas ni votantes; los participantes reclamarán
-    // sus tokens con claimRefund y dispararán las propuestas de signaling
-    // con executeSignaling.
+    // Cierra el periodo de votación. 
+    //  - Ejecuta las propuestas de signaling
+    //  - Devuelve tokens de propuestas no aprobadas
+    //  - Transfiere el presupuesto restante al owner.
     function closeVoting() external onlyOwner onlyVotingOpen {
+        
         votingOpen = false;
-        roundClosed[currentVotingRound] = true;
 
+        // 1. Propuestas de financiación pendientes: descartar y devolver tokens
+        for (uint i = 0; i < pendingFinancingIds.length; i++) {
+            _returnTokensToVoters(pendingFinancingIds[i]);
+        }
+
+        // 2. Propuestas de signaling: ejecutar y devolver tokens
+        for (uint i = 0; i < signalingProposalIds.length; i++) {
+            uint pid = signalingProposalIds[i];
+            Proposal storage p = proposals[pid];
+
+            IExecutableProposal(p.proposalAddress).executeProposal{
+                value: 0,
+                gas: 100000
+            }(pid, p.totalVotes, p.totalTokensStaked);
+
+            // Devolver tokens a votantes
+            _returnTokensToVoters(pid);
+        }
+
+        // 3. Guardar presupuesto restante y limpiar estado
         uint remainingBudget = totalBudget;
         totalBudget = 0;
 
-        // Transferir presupuesto restante al owner (CEI: estado actualizado antes)
+        delete pendingFinancingIds;
+        delete approvedProposalIds;
+        delete signalingProposalIds;
+
+        // 4. Transferir presupuesto restante al owner (última acción, CEI)
         if (remainingBudget > 0) {
             (bool ok, ) = owner.call{value: remainingBudget}("");
             require(ok, "Fallo al transferir presupuesto");
@@ -145,23 +174,32 @@ contract QuadraticVoting {
     // Se puede inscribir en cualquier momento (antes o durante la votación). 
     // Debe enviar ETH suficiente para comprar al menos 1 token. **El cambio sobrante se devuelve.**
     function addParticipant() external payable {
+        // Checks
         require(!participants[msg.sender], "Ya es participante");
+        require(msg.value >= tokenPrice, "Debe comprar al menos 1 token");
 
+        uint numTokens = msg.value / tokenPrice;
+        uint change = msg.value - (numTokens * tokenPrice);
+
+        // Effects: registrar participante y acuñar tokens
         participants[msg.sender] = true;
-        // unchecked: participantCount es un uint256 que solo se incrementa aquí.
-        // El overflow (llegar a 2^256 - 1) requiere que una cantidad prácticamente imposible se inscriba
-        unchecked { participantCount++; }
+        participantCount++;
 
-        _buyTokens(msg.sender, msg.value);
+        votingToken.mint(msg.sender, numTokens);
+
+        // Interactions: devolver cambio si lo hay
+        if (change > 0) {
+            (bool ok, ) = msg.sender.call{value: change}("");
+            require(ok, "Fallo al devolver cambio");
+        }
     }
 
     // Elimina al llamante como participante. 
     // No podrá depositar votos, crear propuestas ni comprar/vender tokens hasta que se vuelva a inscribir.
-    // Sus tokens y votos depositados se conservan (puede reclamarlos vía claimRefund tras el cierre).
+    // Sus votos depositados permanecen vigentes y sus tokens se conservan.
     function removeParticipant() external onlyParticipant {
         participants[msg.sender] = false;
-        // unchecked: el modificador onlyParticipant garantiza que participantCount >= 1
-        unchecked { participantCount--; }
+        participantCount--;
     }
 
     // =========================================================================
@@ -171,8 +209,17 @@ contract QuadraticVoting {
     // Permite a un participante inscrito comprar más tokens.
     // El cambio sobrante se devuelve.
     function buyTokens() external payable onlyParticipant {
-        _buyTokens(msg.sender, msg.value);
+        require(msg.value >= tokenPrice, "ETH insuficiente para 1 token");
 
+        uint numTokens = msg.value / tokenPrice;
+        uint change = msg.value - (numTokens * tokenPrice);
+
+        votingToken.mint(msg.sender, numTokens);
+
+        if (change > 0) {
+            (bool ok, ) = msg.sender.call{value: change}("");
+            require(ok, "Fallo al devolver cambio");
+        }
     }
 
     // Permite a un participante devolver tokens no utilizados y recuperar el ETH
@@ -199,21 +246,19 @@ contract QuadraticVoting {
     // =========================================================================
 
     // Crea una nueva propuesta. Solo participantes con votación abierta.
-    function addProposal(string calldata _title, string calldata _description, uint _budget, address _proposalAddr)
-        external onlyParticipant onlyVotingOpen
-        returns (uint)
+    // _title: Título de la propuesta
+    // _description: Descripción de la propuesta
+    // _budget: Presupuesto en Wei (0 para signaling)
+    // _proposalAddr: Dirección del contrato que implementa IExecutableProposal
+    // Retorna: proposalId - Identificador de la propuesta creada
+    function addProposal(string calldata _title, string calldata _description, uint _budget, address _proposalAddr) 
+        external onlyParticipant onlyVotingOpen 
+        returns (uint) 
     {
         require(_proposalAddr != address(0), "Direccion de propuesta invalida");
-        require(_proposalAddr.code.length > 0, "No implementa IExecutableProposal");
-        (bool success, bytes memory data) = _proposalAddr.staticcall(
-            abi.encodeWithSelector(IERC165.supportsInterface.selector, type(IExecutableProposal).interfaceId)
-        );
-        require(success && data.length >= 32 && abi.decode(data, (bool)), "No implementa IExecutableProposal");
+        require(IERC165(_proposalAddr).supportsInterface(type(IExecutableProposal).interfaceId), "No implementa IExecutableProposal");
 
-        // unchecked: proposalID es un contador que incrementa en uno por cada propuesta creada.
-        // El overflow (llegar a 2^256 - 1) es prácticamente imposible
-        uint proposalId;
-        unchecked { proposalId = proposalCount++; }
+        uint proposalId = proposalCount++;
 
         Proposal storage p = proposals[proposalId];
         p.title = _title;
@@ -226,18 +271,20 @@ contract QuadraticVoting {
 
         if (_budget == 0) {
             // Propuesta de signaling
-            p.arrayIndex = _appendToArray(signalingProposalIds[currentVotingRound], proposalId);
-        } else {
+            p.arrayIndex = signalingProposalIds.length;
+            signalingProposalIds.push(proposalId);
+        } 
+        else {
             // Propuesta de financiación
-            p.arrayIndex = _appendToArray(pendingFinancingIds[currentVotingRound], proposalId);
+            p.arrayIndex = pendingFinancingIds.length;
+            pendingFinancingIds.push(proposalId);
         }
 
         return proposalId;
     }
 
     // Cancela una propuesta pendiente. Solo el creador puede cancelar.
-    // Pull-over-push: NO devuelve tokens; los votantes reclaman con claimRefund.
-    // Coste O(1).
+    // Los tokens depositados en la propuesta se devuelven a sus votantes.
     function cancelProposal(uint proposalId) external onlyVotingOpen {
         Proposal storage p = proposals[proposalId];
 
@@ -248,28 +295,35 @@ contract QuadraticVoting {
         p.status = ProposalStatus.Cancelled;
 
         if (p.budget == 0) {
-            _removeFromArray(signalingProposalIds[currentVotingRound], p.arrayIndex);
-        } else {
-            _removeFromArray(pendingFinancingIds[currentVotingRound], p.arrayIndex);
+            _removeFromArray(signalingProposalIds, p.arrayIndex);
+        } 
+        else {
+            _removeFromArray(pendingFinancingIds, p.arrayIndex);
         }
+
+        _returnTokensToVoters(proposalId);
     }
 
     // =========================================================================
     //                       CONSULTAS DE PROPUESTAS
     // =========================================================================
 
-    function getPendingProposals() external view onlyVotingOpen returns (uint[] memory) {
-        return pendingFinancingIds[currentVotingRound];
+    // Devuelve los IDs de las propuestas de financiación pendientes.
+    function getPendingProposals() external view onlyVotingOpen returns (uint[] memory){
+        return pendingFinancingIds;
     }
 
-    function getApprovedProposals() external view onlyVotingOpen returns (uint[] memory) {
-        return approvedProposalIds[currentVotingRound];
+    // Devuelve los IDs de las propuestas aprobadas.
+    function getApprovedProposals() external view onlyVotingOpen returns (uint[] memory){
+        return approvedProposalIds;
     }
 
-    function getSignalingProposals() external view onlyVotingOpen returns (uint[] memory) {
-        return signalingProposalIds[currentVotingRound];
+    // Devuelve los IDs de las propuestas de signaling.
+    function getSignalingProposals() external view onlyVotingOpen returns (uint[] memory){
+        return signalingProposalIds;
     }
 
+    // Devuelve los datos de una propuesta de la ronda actual.
     function getProposalInfo(uint proposalId) external view onlyVotingOpen returns (
             string memory title,
             string memory description,
@@ -281,6 +335,7 @@ contract QuadraticVoting {
         )
     {
         Proposal storage p = proposals[proposalId];
+
         require(p.votingRound == currentVotingRound, "Propuesta no es de la ronda actual");
 
         return (
@@ -298,7 +353,10 @@ contract QuadraticVoting {
     //                            VOTACIÓN
     // =========================================================================
 
-    // Deposita votos sobre una propuesta. Coste cuadrático sobre el total acumulado del votante.
+    // Deposita votos sobre una propuesta. 
+    // El coste en tokens es cuadrático respecto al total de votos del votante en esa propuesta.
+    // **Requiere que el votante haya cedido (approve) los tokens necesarios al contrato QuadraticVoting previamente.**
+    // El coste de pasar de prevVotes a (prevVotes + numVotes) votos es: (prevVotes + numVotes)² - prevVotes²
     function stake(uint proposalId, uint numVotes) external onlyParticipant onlyVotingOpen {
         require(numVotes > 0, "Debe depositar al menos 1 voto");
 
@@ -312,11 +370,17 @@ contract QuadraticVoting {
         uint newTotal = prevVotes + numVotes;
         uint tokenCost = (newTotal * newTotal) - (prevVotes * prevVotes);
 
+        votingToken.transferFrom(msg.sender, address(this), tokenCost);
+
+        // Registrar votante si es su primer voto en esta propuesta
+        if (!p.hasVoted[msg.sender]) {
+            p.voters.push(msg.sender);
+            p.hasVoted[msg.sender] = true;
+        }
+
         p.voterVotes[msg.sender] = newTotal;
         p.totalVotes += numVotes;
         p.totalTokensStaked += tokenCost;
-
-        votingToken.transferFrom(msg.sender, address(this), tokenCost);
 
         // Si es propuesta de financiación, comprobar si debe aprobarse
         if (p.budget > 0) {
@@ -349,52 +413,6 @@ contract QuadraticVoting {
     }
 
     // =========================================================================
-    //                        PULL-OVER-PUSH
-    // =========================================================================
-
-    // Reclama los tokens de votos depositados en una propuesta
-    // - Propuestas canceladas: cualquier ronda
-    // - Propuestas pendientes: rondas cerradas
-    // Coste O(1).
-    function claimRefund(uint proposalId) external {
-        Proposal storage p = proposals[proposalId];
-
-        uint votes = p.voterVotes[msg.sender];
-        require(votes > 0, "Sin votos a reclamar");
-
-        bool refundable = (p.status == ProposalStatus.Cancelled) ||
-                          (roundClosed[p.votingRound] && p.status == ProposalStatus.Pending);
-        require(refundable, "Propuesta no reembolsable");
-
-        uint tokensToReturn = votes * votes;
-
-        p.voterVotes[msg.sender] = 0;
-
-        p.totalVotes -= votes;
-        p.totalTokensStaked -= tokensToReturn;
-
-        votingToken.transfer(msg.sender, tokensToReturn);
-    }
-
-    // Dispara la ejecución de una propuesta de signaling de una ronda ya cerrada.
-    function executeSignaling(uint proposalId) external {
-        Proposal storage p = proposals[proposalId];
-
-        require(p.budget == 0, "No es propuesta de signaling");
-        require(roundClosed[p.votingRound], "La ronda aun esta abierta");
-        require(p.status == ProposalStatus.Pending, "Propuesta cancelada");
-        require(!p.signalingExecuted, "Ya ejecutada");
-
-        // Effect antes de Interaction (CEI) para impedir reentradas
-        p.signalingExecuted = true;
-
-        IExecutableProposal(p.proposalAddress).executeProposal{
-            value: 0,
-            gas: 100000
-        }(proposalId, p.totalVotes, p.totalTokensStaked);
-    }
-
-    // =========================================================================
     //                       FUNCIONES INTERNAS
     // =========================================================================
 
@@ -406,27 +424,37 @@ contract QuadraticVoting {
         // Condición 1: presupuesto total suficiente para financiar la propuesta
         if (totalBudget < p.budget) return;
 
-        // Condición 2: votos superan el umbral.
-        // threshold_i = (0.2 + budget_i/totalBudget) * numParticipants + numPendingProposals
-        // Reescribimos sin divisiones multiplicando ambos lados por (5 * totalBudget):
-        // totalVotes_i * 5 * totalBudget > (totalBudget + 5 * budget_i) * numParticipants + numPendingProposals * 5 * totalBudget
+        // Condición 2: votos superan el umbral (totalVotes_i > threshold_i)
 
+        // Para lidiar con divisiones, escalamos con denominador
+
+        // threshold_i = (0.2 + budget_i/totalBudget) * numParticipants + numPendingProposals
+        // threshold_i = (1/5 + budget_i/totalBudget) * numParticipants + numPendingProposals
+        // threshold_i = ((totalBudget + 5 * budget_i) / (5 * totalBudget)) * numParticipants + numPendingProposals
+
+        // threshold_i * (5 * totalBudget) = (totalBudget + 5 * budget_i) * numParticipants + numPendingProposals * 5 * totalBudget
+
+        // totalVotes_i > threshold_i
+        // totalVotes_i * (5 * totalBudget) > threshold_i * (5 * totalBudget)
+        // totalVotes_i * (5 * totalBudget) > (totalBudget + 5 * budget_i) * numParticipants + numPendingProposals * 5 * totalBudget
+    
         uint left = p.totalVotes * 5 * totalBudget;
-        uint right = (totalBudget + 5 * p.budget) * participantCount + pendingFinancingIds[currentVotingRound].length * 5 * totalBudget;
+        uint right = (totalBudget + 5 * p.budget) * participantCount + pendingFinancingIds.length * 5 * totalBudget;
 
         if (left <= right) return;
 
         // PROPUESTA APROBADA
 
-        // Actualizar presupuesto: sumar valor en wei de los tokens consumidos, restar coste de la propuesta
+        // Actualizar presupuesto: sumar valor de tokens consumidos, restar presupuesto de la propuesta
         uint tokenValue = p.totalTokensStaked * tokenPrice;
         totalBudget = totalBudget + tokenValue - p.budget;
 
         p.status = ProposalStatus.Approved;
 
-        // Mover de pendientes a aprobadas (swap-and-pop, O(1))
-        _removeFromArray(pendingFinancingIds[currentVotingRound], p.arrayIndex);
-        p.arrayIndex = _appendToArray(approvedProposalIds[currentVotingRound], proposalId);
+        // Mover de pendingFinancingIds a approvedProposalIds (swap-and-pop)
+        _removeFromArray(pendingFinancingIds, p.arrayIndex);
+        p.arrayIndex = approvedProposalIds.length;
+        approvedProposalIds.push(proposalId);
 
         // Quemar los tokens consumidos por la aprobación
         votingToken.burn(address(this), p.totalTokensStaked);
@@ -442,43 +470,40 @@ contract QuadraticVoting {
         }(proposalId, executionVotes, executionTokens);
     }
 
-    // Añade un ID al final del array y devuelve el índice donde quedó.
-    // Centraliza el patrón "asignar arrayIndex y push" usado al crear propuestas
-    // y al promover de pendientes a aprobadas. Coste O(1).
-    function _appendToArray(uint[] storage arr, uint proposalId) internal returns (uint newIndex) {
-        newIndex = arr.length;
-        arr.push(proposalId);
+    // Devuelve los tokens bloqueados a todos los votantes de una propuesta.
+    // El coste de n votos es n² tokens, por lo que se devuelve voterVotes[v]² tokens a cada votante v.
+    function _returnTokensToVoters(uint proposalId) internal {
+        Proposal storage p = proposals[proposalId];
+
+        for (uint i = 0; i < p.voters.length; i++) {
+            address voter = p.voters[i];
+            uint votes = p.voterVotes[voter];
+
+            if (votes > 0) {
+                uint tokens = votes * votes;
+                p.voterVotes[voter] = 0;
+                votingToken.transfer(voter, tokens);
+            }
+        }
+
+        p.totalVotes = 0;
+        p.totalTokensStaked = 0;
     }
 
     // Elimina un elemento de un array de IDs usando swap-and-pop.
-    // Actualiza el arrayIndex de la propuesta movida. Coste O(1).
+    // Actualiza el arrayIndex de la propuesta que se mueve al hueco.
+    // Coste: O(1).
+    // arr: Array de IDs (storage reference)
+    // index: Índice del elemento a eliminar
     function _removeFromArray(uint[] storage arr, uint index) internal {
-        // unchecked: el caller solo invoca esta función con un index válido
-        // proveniente de p.arrayIndex de una propuesta que está en arr.
-        // Por tanto arr.length >= 1 y la resta no puede generar underflow.
-        uint lastIndex;
-        unchecked { lastIndex = arr.length - 1; }
+        uint lastIdx = arr.length - 1;
 
-        if (index != lastIndex) {
-            uint lastId = arr[lastIndex];
+        if (index != lastIdx) {
+            uint lastId = arr[lastIdx];
             arr[index] = lastId;
             proposals[lastId].arrayIndex = index;
         }
 
         arr.pop();
-    }
-
-    function _buyTokens(address sender, uint ethSent) internal {
-        require(ethSent >= tokenPrice, "ETH insuficiente para 1 token");
-
-        uint numTokens = ethSent / tokenPrice;
-        uint change = ethSent - (numTokens * tokenPrice);
-
-        votingToken.mint(sender, numTokens);
-        
-        if (change > 0) {
-            (bool ok, ) = sender.call{value: change}("");
-            require(ok, "Fallo al devolver cambio");
-        }
     }
 }
