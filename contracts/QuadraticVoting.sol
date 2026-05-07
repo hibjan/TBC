@@ -90,6 +90,11 @@ contract QuadraticVoting {
         _;
     }
 
+    modifier onlyExistingVotingRound(uint votingRound) {
+        require(votingRound > 0 && votingRound <= currentVotingRound, "La ronda de votacion no existe");
+        _;
+    }
+
     // =========================================================================
     //                           CONSTRUCTOR
     // =========================================================================
@@ -179,6 +184,7 @@ contract QuadraticVoting {
     function sellTokens(uint numTokens) external onlyParticipant {
         require(numTokens > 0, "Debe vender al menos 1 token");
         require(votingToken.balanceOf(msg.sender) >= numTokens, "Tokens insuficientes");
+        require(votingToken.allowance(msg.sender, address(this)) >= numTokens, "Allowance insuficiente");
 
         votingToken.burn(msg.sender, numTokens);
 
@@ -270,7 +276,19 @@ contract QuadraticVoting {
         return signalingProposalIds[currentVotingRound];
     }
 
-    function getProposalInfo(uint proposalId) external view onlyVotingOpen returns (
+     function getPendingProposals(uint votingRound) external view onlyExistingVotingRound(votingRound) returns (uint[] memory) {
+        return pendingFinancingIds[votingRound];
+    }
+
+    function getApprovedProposals(uint votingRound) external view onlyExistingVotingRound(votingRound) returns (uint[] memory) {
+        return approvedProposalIds[votingRound];
+    }
+
+    function getSignalingProposals(uint votingRound) external view onlyExistingVotingRound(votingRound) returns (uint[] memory) {
+        return signalingProposalIds[votingRound];
+    }
+
+    function getProposalInfo(uint proposalId) external view returns (
             string memory title,
             string memory description,
             uint budget,
@@ -365,6 +383,7 @@ contract QuadraticVoting {
         bool refundable = (p.status == ProposalStatus.Cancelled) ||
                           (roundClosed[p.votingRound] && p.status == ProposalStatus.Pending);
         require(refundable, "Propuesta no reembolsable");
+        require(p.budget != 0 || p.status == ProposalStatus.Cancelled || p.signalingExecuted, "Ejecuta executeSignaling primero");
 
         uint tokensToReturn = votes * votes;
 
